@@ -11,10 +11,12 @@ import warnings
 from contextlib import suppress
 from types import SimpleNamespace, TracebackType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Awaitable,
     Callable,
     Coroutine,
+    Final,
     FrozenSet,
     Generator,
     Generic,
@@ -72,13 +74,14 @@ from .connector import (
 )
 from .cookiejar import CookieJar
 from .helpers import (
+    _SENTINEL,
     DEBUG,
-    PY_36,
     BasicAuth,
     TimeoutHandle,
     ceil_timeout,
     get_env_proxy_for_url,
     get_running_loop,
+    method_must_be_empty_body,
     sentinel,
     strip_auth_from_url,
 )
@@ -86,12 +89,7 @@ from .http import WS_KEY, HttpVersion, WebSocketReader, WebSocketWriter
 from .http_websocket import WSHandshakeError, WSMessage, ws_ext_gen, ws_ext_parse
 from .streams import FlowControlDataQueue
 from .tracing import Trace, TraceConfig
-from .typedefs import Final, JSONEncoder, LooseCookies, LooseHeaders, StrOrURL
-
-try:
-    import cchardet as chardet
-except ImportError:  # pragma: no cover
-    import charset_normalizer as chardet  # type: ignore[no-redef]
+from .typedefs import JSONEncoder, LooseCookies, LooseHeaders, StrOrURL
 
 __all__ = (
     # client_exceptions
@@ -133,10 +131,10 @@ __all__ = (
 )
 
 
-try:
+if TYPE_CHECKING:
     from ssl import SSLContext
-except ImportError:  # pragma: no cover
-    SSLContext = object  # type: ignore[misc,assignment]
+else:
+    SSLContext = None
 
 
 @attr.s(auto_attribs=True, frozen=True, slots=True)
@@ -145,6 +143,7 @@ class ClientTimeout:
     connect: Optional[float] = None
     sock_read: Optional[float] = None
     sock_connect: Optional[float] = None
+    ceil_threshold: float = 5
 
     # pool_queue_timeout: Optional[float] = None
     # dns_resolution_timeout: Optional[float] = None
@@ -165,21 +164,6 @@ DEFAULT_TIMEOUT: Final[ClientTimeout] = ClientTimeout(total=5 * 60)
 
 _RetType = TypeVar("_RetType")
 _CharsetResolver = Callable[[ClientResponse, bytes], str]
-
-
-def _default_fallback_charset_resolver(response: ClientResponse, body: bytes) -> str:
-
-    ret: str = chardet.detect(body)["encoding"] or "utf-8"
-
-    if ret != "utf-8":
-        warnings.warn(
-            "Automatic charset detection will be removed in 3.9, see: "
-            "https://docs.aiohttp.org/en/stable/client_advanced.html#character-set-detection",  # noqa: E501
-            DeprecationWarning,
-            stacklevel=3,
-        )
-
-    return ret
 
 
 class ClientSession:
@@ -209,11 +193,14 @@ class ClientSession:
             "_ws_response_class",
             "_trace_configs",
             "_read_bufsize",
+            "_max_line_size",
+            "_max_field_size",
+            "_resolve_charset",
         ]
     )
 
-    _source_traceback = None  # type: Optional[traceback.StackSummary]
-    _connector = None  # type: Optional[BaseConnector]
+    _source_traceback: Optional[traceback.StackSummary] = None
+    _connector: Optional[BaseConnector] = None
 
     def __init__(
         self,
@@ -232,8 +219,10 @@ class ClientSession:
         version: HttpVersion = http.HttpVersion11,
         cookie_jar: Optional[AbstractCookieJar] = None,
         connector_owner: bool = True,
-        raise_for_status: bool = False,
-        read_timeout: Union[float, object] = sentinel,
+        raise_for_status: Union[
+            bool, Callable[[ClientResponse], Awaitable[None]]
+        ] = False,
+        read_timeout: Union[float, _SENTINEL] = sentinel,
         conn_timeout: Optional[float] = None,
         timeout: Union[object, ClientTimeout] = sentinel,
         auto_decompress: bool = True,
@@ -241,10 +230,48 @@ class ClientSession:
         requote_redirect_url: bool = True,
         trace_configs: Optional[List[TraceConfig]] = None,
         read_bufsize: int = 2**16,
-        fallback_charset_resolver: _CharsetResolver = (
-            _default_fallback_charset_resolver
-        ),
+        max_line_size: int = 8190,
+        max_field_size: int = 8190,
+        fallback_charset_resolver: _CharsetResolver = lambda r, b: "utf-8",
     ) -> None:
+        # We initialise _connector to None immediately, as it's referenced in __del__()
+        # and could cause issues if an exception occurs during initialisation.
+        self._connector: Optional[BaseConnector] = None
+        if timeout is sentinel or timeout is None:
+            self._timeout = DEFAULT_TIMEOUT
+            if read_timeout is not sentinel:
+                warnings.warn(
+                    "read_timeout is deprecated, " "use timeout argument instead",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                self._timeout = attr.evolve(self._timeout, total=read_timeout)
+            if conn_timeout is not None:
+                self._timeout = attr.evolve(self._timeout, connect=conn_timeout)
+                warnings.warn(
+                    "conn_timeout is deprecated, " "use timeout argument instead",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+        else:
+            if not isinstance(timeout, ClientTimeout):
+                raise ValueError(
+                    f"timeout parameter cannot be of {type(timeout)} type, "
+                    "please use 'timeout=ClientTimeout(...)'",
+                )
+            self._timeout = timeout
+            if read_timeout is not sentinel:
+                raise ValueError(
+                    "read_timeout and timeout parameters "
+                    "conflict, please setup "
+                    "timeout.read"
+                )
+            if conn_timeout is not None:
+                raise ValueError(
+                    "conn_timeout and timeout parameters "
+                    "conflict, please setup "
+                    "timeout.connect"
+                )
         if loop is None:
             if connector is not None:
                 loop = connector._loop
@@ -282,41 +309,13 @@ class ClientSession:
         self._default_auth = auth
         self._version = version
         self._json_serialize = json_serialize
-        if timeout is sentinel:
-            self._timeout = DEFAULT_TIMEOUT
-            if read_timeout is not sentinel:
-                warnings.warn(
-                    "read_timeout is deprecated, " "use timeout argument instead",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-                self._timeout = attr.evolve(self._timeout, total=read_timeout)
-            if conn_timeout is not None:
-                self._timeout = attr.evolve(self._timeout, connect=conn_timeout)
-                warnings.warn(
-                    "conn_timeout is deprecated, " "use timeout argument instead",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-        else:
-            self._timeout = timeout  # type: ignore[assignment]
-            if read_timeout is not sentinel:
-                raise ValueError(
-                    "read_timeout and timeout parameters "
-                    "conflict, please setup "
-                    "timeout.read"
-                )
-            if conn_timeout is not None:
-                raise ValueError(
-                    "conn_timeout and timeout parameters "
-                    "conflict, please setup "
-                    "timeout.connect"
-                )
         self._raise_for_status = raise_for_status
         self._auto_decompress = auto_decompress
         self._trust_env = trust_env
         self._requote_redirect_url = requote_redirect_url
         self._read_bufsize = read_bufsize
+        self._max_line_size = max_line_size
+        self._max_field_size = max_field_size
 
         # Convert to list of tuples
         if headers:
@@ -361,10 +360,7 @@ class ClientSession:
 
     def __del__(self, _warnings: Any = warnings) -> None:
         if not self.closed:
-            if PY_36:
-                kwargs = {"source": self}
-            else:
-                kwargs = {}
+            kwargs = {"source": self}
             _warnings.warn(
                 f"Unclosed client session {self!r}", ResourceWarning, **kwargs
             )
@@ -404,18 +400,24 @@ class ClientSession:
         compress: Optional[str] = None,
         chunked: Optional[bool] = None,
         expect100: bool = False,
-        raise_for_status: Optional[bool] = None,
+        raise_for_status: Union[
+            None, bool, Callable[[ClientResponse], Awaitable[None]]
+        ] = None,
         read_until_eof: bool = True,
         proxy: Optional[StrOrURL] = None,
         proxy_auth: Optional[BasicAuth] = None,
-        timeout: Union[ClientTimeout, object] = sentinel,
+        timeout: Union[ClientTimeout, _SENTINEL] = sentinel,
         verify_ssl: Optional[bool] = None,
         fingerprint: Optional[bytes] = None,
         ssl_context: Optional[SSLContext] = None,
-        ssl: Optional[Union[SSLContext, bool, Fingerprint]] = None,
+        ssl: Union[SSLContext, bool, Fingerprint] = True,
+        server_hostname: Optional[str] = None,
         proxy_headers: Optional[LooseHeaders] = None,
         trace_request_ctx: Optional[SimpleNamespace] = None,
         read_bufsize: Optional[int] = None,
+        auto_decompress: Optional[bool] = None,
+        max_line_size: Optional[int] = None,
+        max_field_size: Optional[int] = None,
     ) -> ClientResponse:
 
         # NOTE: timeout clamps existing connect and read timeouts.  We cannot
@@ -440,6 +442,7 @@ class ClientSession:
         redirects = 0
         history = []
         version = self._version
+        params = params or {}
 
         # Merge with default headers and transform to CIMultiDict
         headers = self._prepare_headers(headers)
@@ -465,16 +468,27 @@ class ClientSession:
             real_timeout: ClientTimeout = self._timeout
         else:
             if not isinstance(timeout, ClientTimeout):
-                real_timeout = ClientTimeout(total=timeout)  # type: ignore[arg-type]
+                real_timeout = ClientTimeout(total=timeout)
             else:
                 real_timeout = timeout
         # timeout is cumulative for all request operations
         # (request, redirects, responses, data consuming)
-        tm = TimeoutHandle(self._loop, real_timeout.total)
+        tm = TimeoutHandle(
+            self._loop, real_timeout.total, ceil_threshold=real_timeout.ceil_threshold
+        )
         handle = tm.start()
 
         if read_bufsize is None:
             read_bufsize = self._read_bufsize
+
+        if auto_decompress is None:
+            auto_decompress = self._auto_decompress
+
+        if max_line_size is None:
+            max_line_size = self._max_line_size
+
+        if max_field_size is None:
+            max_field_size = self._max_field_size
 
         traces = [
             Trace(
@@ -550,14 +564,19 @@ class ClientSession:
                         proxy_auth=proxy_auth,
                         timer=timer,
                         session=self,
-                        ssl=ssl,
+                        ssl=ssl if ssl is not None else True,
+                        server_hostname=server_hostname,
                         proxy_headers=proxy_headers,
                         traces=traces,
+                        trust_env=self.trust_env,
                     )
 
                     # connection timeout
                     try:
-                        async with ceil_timeout(real_timeout.connect):
+                        async with ceil_timeout(
+                            real_timeout.connect,
+                            ceil_threshold=real_timeout.ceil_threshold,
+                        ):
                             assert self._connector is not None
                             conn = await self._connector.connect(
                                 req, traces=traces, timeout=real_timeout
@@ -572,11 +591,14 @@ class ClientSession:
                     assert conn.protocol is not None
                     conn.protocol.set_response_params(
                         timer=timer,
-                        skip_payload=method.upper() == "HEAD",
+                        skip_payload=method_must_be_empty_body(method),
                         read_until_eof=read_until_eof,
-                        auto_decompress=self._auto_decompress,
+                        auto_decompress=auto_decompress,
                         read_timeout=real_timeout.sock_read,
                         read_bufsize=read_bufsize,
+                        timeout_ceil_threshold=self._connector._timeout_ceil_threshold,
+                        max_line_size=max_line_size,
+                        max_field_size=max_field_size,
                     )
 
                     try:
@@ -656,7 +678,7 @@ class ClientSession:
                             headers.pop(hdrs.AUTHORIZATION, None)
 
                         url = parsed_url
-                        params = None
+                        params = {}
                         resp.release()
                         continue
 
@@ -665,7 +687,12 @@ class ClientSession:
             # check response status
             if raise_for_status is None:
                 raise_for_status = self._raise_for_status
-            if raise_for_status:
+
+            if raise_for_status is None:
+                pass
+            elif callable(raise_for_status):
+                await raise_for_status(resp)
+            elif raise_for_status:
                 resp.raise_for_status()
 
             # register connection
@@ -713,7 +740,7 @@ class ClientSession:
         headers: Optional[LooseHeaders] = None,
         proxy: Optional[StrOrURL] = None,
         proxy_auth: Optional[BasicAuth] = None,
-        ssl: Union[SSLContext, bool, None, Fingerprint] = None,
+        ssl: Union[SSLContext, bool, None, Fingerprint] = True,
         verify_ssl: Optional[bool] = None,
         fingerprint: Optional[bytes] = None,
         ssl_context: Optional[SSLContext] = None,
@@ -765,7 +792,7 @@ class ClientSession:
         headers: Optional[LooseHeaders] = None,
         proxy: Optional[StrOrURL] = None,
         proxy_auth: Optional[BasicAuth] = None,
-        ssl: Union[SSLContext, bool, None, Fingerprint] = None,
+        ssl: Optional[Union[SSLContext, bool, Fingerprint]] = True,
         verify_ssl: Optional[bool] = None,
         fingerprint: Optional[bytes] = None,
         ssl_context: Optional[SSLContext] = None,
@@ -781,7 +808,7 @@ class ClientSession:
 
         default_headers = {
             hdrs.UPGRADE: "websocket",
-            hdrs.CONNECTION: "upgrade",
+            hdrs.CONNECTION: "Upgrade",
             hdrs.SEC_WEBSOCKET_VERSION: "13",
         }
 
@@ -799,6 +826,9 @@ class ClientSession:
             extstr = ws_ext_gen(compress=compress)
             real_headers[hdrs.SEC_WEBSOCKET_EXTENSIONS] = extstr
 
+        # For the sake of backward compatibility, if user passes in None, convert it to True
+        if ssl is None:
+            ssl = True
         ssl = _merge_ssl_params(ssl, verify_ssl, ssl_context, fingerprint)
 
         # send request
@@ -1150,8 +1180,8 @@ class _BaseRequestContextManager(Coroutine[Any, Any, _RetType], Generic[_RetType
     def send(self, arg: None) -> "asyncio.Future[Any]":
         return self._coro.send(arg)
 
-    def throw(self, arg: BaseException) -> None:  # type: ignore[arg-type,override]
-        self._coro.throw(arg)
+    def throw(self, *args: Any, **kwargs: Any) -> "asyncio.Future[Any]":
+        return self._coro.throw(*args, **kwargs)
 
     def close(self) -> None:
         return self._coro.close()
@@ -1183,6 +1213,7 @@ class _RequestContextManager(_BaseRequestContextManager[ClientResponse]):
         # explicitly.  Otherwise connection error handling should kick in
         # and close/recycle the connection as required.
         self._resp.release()
+        await self._resp.wait_for_close()
 
 
 class _WSRequestContextManager(_BaseRequestContextManager[ClientWebSocketResponse]):
@@ -1255,6 +1286,8 @@ def request(
     connector: Optional[BaseConnector] = None,
     read_bufsize: Optional[int] = None,
     loop: Optional[asyncio.AbstractEventLoop] = None,
+    max_line_size: int = 8190,
+    max_field_size: int = 8190,
 ) -> _SessionRequestContextManager:
     """Constructs and sends a request.
 
@@ -1326,6 +1359,8 @@ def request(
             proxy=proxy,
             proxy_auth=proxy_auth,
             read_bufsize=read_bufsize,
+            max_line_size=max_line_size,
+            max_field_size=max_field_size,
         ),
         session,
     )

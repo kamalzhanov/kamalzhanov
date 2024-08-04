@@ -5,7 +5,7 @@ import logging, sqlite3, time
 from aiogram.dispatcher.storage import FSMContext
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
-from aiogram.dispatcher.filters. state import State, StatesGroup
+from aiogram.dispatcher.filters.state import State, StatesGroup
 
 storage = MemoryStorage()
 bot = Bot(token=token)
@@ -18,7 +18,7 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS users(
                id INT,
                first_name  VARCHAR (100),
                last_name  VARCHAR (100),
-               username  VARCHAR (100),
+               username  VARCHAR (100),             
                created VARCHAR (100)
 );
  """)
